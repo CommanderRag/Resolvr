@@ -23,7 +23,8 @@ CREATE TABLE tickets (
     error             text,
     created_at        timestamptz NOT NULL DEFAULT now(),
     processed_at      timestamptz,
-    latency_ms        integer,                    -- processing time (classify+retrieve+draft)
+    latency_ms        integer,                    -- processing time (classify+retrieve+draft, or cache lookup)
+    cache_hit         boolean NOT NULL DEFAULT false,  -- answered from Redis instead of calling the LLM
     -- a finished ticket must carry its result; a failed one must carry an error
     CONSTRAINT done_has_result  CHECK (status <> 'done'   OR (intent IS NOT NULL AND reply IS NOT NULL AND auto_handle IS NOT NULL)),
     CONSTRAINT failed_has_error CHECK (status <> 'failed' OR error IS NOT NULL)
