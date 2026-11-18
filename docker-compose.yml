@@ -1,0 +1,39 @@
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: resolvr
+      POSTGRES_PASSWORD: resolvr
+      POSTGRES_DB: resolvr
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # runs only on the first start of an empty volume; `docker compose down -v` to re-apply
+      - ./service/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resolvr -d resolvr"]
+      interval: 2s
+      retries: 15
+ 
+  api:
+    build: .
+    env_file: .env            # must contain GROQ_API_KEY (see .env.example)
+    environment:
+      DATABASE_URL: postgresql://resolvr:resolvr@db:5432/resolvr
+      HF_HUB_DOWNLOAD_TIMEOUT: "120"   # slow/flaky networks: be patient with model downloads
+      HF_HUB_ETAG_TIMEOUT: "60"
+    restart: on-failure                # retry startup until the model download succeeds
+    volumes:
+      - hf_cache:/root/.cache/huggingface   # keep the embedding model across restarts
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+ 
+volumes:
+  pgdata:
+  hf_cache:
+ 
