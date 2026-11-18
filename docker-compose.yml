@@ -1,4 +1,3 @@
-
 services:
   db:
     image: postgres:16
@@ -16,12 +15,22 @@ services:
       test: ["CMD-SHELL", "pg_isready -U resolvr -d resolvr"]
       interval: 2s
       retries: 15
- 
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 15
+
   api:
     build: .
     env_file: .env            # must contain GROQ_API_KEY (see .env.example)
     environment:
       DATABASE_URL: postgresql://resolvr:resolvr@db:5432/resolvr
+      REDIS_URL: redis://redis:6379/0
       HF_HUB_DOWNLOAD_TIMEOUT: "120"   # slow/flaky networks: be patient with model downloads
       HF_HUB_ETAG_TIMEOUT: "60"
     restart: on-failure                # retry startup until the model download succeeds
@@ -30,10 +39,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "8000:8000"
- 
+
 volumes:
   pgdata:
   hf_cache:
- 
