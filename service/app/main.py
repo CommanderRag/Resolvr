@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import time
 import uuid
@@ -21,10 +22,12 @@ async def lifespan(app: FastAPI):
     await db.apply_upgrades(app.state.pool)
     if getattr(app.state, "cache", None) is None:  # tests inject their own
         app.state.cache = Cache(config.REDIS_URL, config.CACHE_TTL_SECONDS)
+    if getattr(app.state, "llm_slots", None) is None:
+        app.state.llm_slots = asyncio.Semaphore(config.MAX_CONCURRENT_LLM)
     if getattr(app.state, "engine", None) is None:
         from .engine import Engine
 
-        app.state.engine = Engine(config.RESOLVR_SRC, config.DATA_DIR)
+        app.state.engine = Engine(config.RESOLVR_SRC, config.DATA_DIR, config.GROQ_MAX_RETRIES)
         await db.seed_grounding(app.state.pool, app.state.engine.pairs)
     yield
     await app.state.cache.close()
@@ -43,7 +46,10 @@ async def process_ticket(app: FastAPI, ticket_id: uuid.UUID) -> None:
         return
     started = time.perf_counter()
     try:
-        result, cache_hit = await resolve(app.state.engine, app.state.cache, claimed["text"], claimed["text_hash"])
+        result, cache_hit = await resolve(
+            app.state.engine, app.state.cache, claimed["text"], claimed["text_hash"],
+            slots=getattr(app.state, "llm_slots", None),
+        )
         await db.finish_ticket(pool, ticket_id, result, int((time.perf_counter() - started) * 1000), cache_hit)
     except Exception as exc:  # record the failure on the ticket instead of losing it
         await db.fail_ticket(pool, ticket_id, f"{type(exc).__name__}: {exc}"[:500])

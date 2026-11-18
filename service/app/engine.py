@@ -4,6 +4,7 @@ Heavy objects (embedding model, embedding matrix) are loaded once at startup.
 `process` is blocking (Groq calls + model inference), so the API runs it in a
 thread pool and never on the event loop.
 """
+import os
 import pickle
 import sys
 from dataclasses import dataclass
@@ -22,13 +23,18 @@ class Result:
 
 
 class Engine:
-    def __init__(self, src_dir: str, data_dir: str):
+    def __init__(self, src_dir: str, data_dir: str, max_retries: int = 6):
         import numpy as np  # heavy deps are imported here so tests can import Result without them
 
         sys.path.insert(0, src_dir)
         import pipeline  # noqa: E402  (needs GROQ_API_KEY in the environment)
         from sentence_transformers import SentenceTransformer
 
+        from groq import Groq
+
+        # pipeline.py's functions use this module-level client: replace it with one that retries
+        # rate-limit (429) and server errors with exponential backoff instead of failing the ticket.
+        pipeline.client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=max_retries, timeout=60.0)
         self._pipeline = pipeline
         with open(f"{data_dir}/grounding_pairs.pkl", "rb") as f:
             self.pairs = pickle.load(f)

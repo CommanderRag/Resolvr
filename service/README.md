@@ -44,3 +44,6 @@ TEST_DATABASE_URL=postgresql://resolvr:resolvr@localhost:5432/resolvr_test pytes
   compare-and-delete Lua script); one request calls the LLM, the others wait for its result.
 - **Redis is an optimisation, not a dependency**: if it is down every cache call behaves as a miss and
   the API keeps working, just slower. Failures are never cached.
+- **Provider rate limits**: a burst of never-seen messages used to fail with HTTP 429 (4 of 15 in a load
+  test). Engine calls are now capped by a semaphore (`MAX_CONCURRENT_LLM`, default 4) so bursts queue,
+  and the Groq client retries 429/5xx with exponential backoff (`GROQ_MAX_RETRIES`, default 6).

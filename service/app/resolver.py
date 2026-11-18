@@ -4,6 +4,8 @@
 - miss -> one request takes a Redis lock and computes; identical concurrent requests wait
           for that result instead of each paying for their own LLM call
 - if the lock holder fails, a waiter takes over; if Redis is down, everyone just computes
+- `slots` (an asyncio.Semaphore) caps how many engine calls run at once, so a burst queues
+  instead of tripping the LLM provider's rate limit
 """
 import asyncio
 import time
@@ -14,13 +16,17 @@ POLL_INTERVAL = 0.2   # seconds between checks while another request is computin
 MAX_WAIT = 20.0       # then give up waiting and compute ourselves
 
 
-async def _compute(engine, cache, text, text_hash):
-    result = await run_in_threadpool(engine.process, text)  # blocking work stays off the event loop
+async def _compute(engine, cache, text, text_hash, slots):
+    if slots is None:
+        result = await run_in_threadpool(engine.process, text)  # blocking work stays off the event loop
+    else:
+        async with slots:
+            result = await run_in_threadpool(engine.process, text)
     await cache.set(text_hash, result)
     return result
 
 
-async def resolve(engine, cache, text: str, text_hash: str):
+async def resolve(engine, cache, text: str, text_hash: str, slots=None):
     """Return (result, cache_hit)."""
     deadline = time.monotonic() + MAX_WAIT
     while True:
@@ -34,10 +40,10 @@ async def resolve(engine, cache, text: str, text_hash: str):
                 hit = await cache.get(text_hash)  # it may have landed while we took the lock
                 if hit is not None:
                     return hit, True
-                return await _compute(engine, cache, text, text_hash), False
+                return await _compute(engine, cache, text, text_hash, slots), False
             finally:
                 await cache.release_lock(text_hash, token)
 
         if time.monotonic() >= deadline:
-            return await _compute(engine, cache, text, text_hash), False
+            return await _compute(engine, cache, text, text_hash, slots), False
         await asyncio.sleep(POLL_INTERVAL)

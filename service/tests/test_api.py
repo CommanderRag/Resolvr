@@ -60,15 +60,23 @@ class FakeEngine:
         self.fail = False
         self.delay = 0.0
         self.calls = 0
+        self.active = 0
+        self.max_active = 0
         self._lock = threading.Lock()
 
     def process(self, text: str) -> Result:
         with self._lock:
             self.calls += 1
-        if self.delay:
-            time.sleep(self.delay)
-        if self.fail:
-            raise RuntimeError("llm unavailable")
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            if self.fail:
+                raise RuntimeError("llm unavailable")
+        finally:
+            with self._lock:
+                self.active -= 1
         return Result("Delivery delay", False, "needs a human", f"echo: {text}", [(2, 0.9), (0, 0.5), (1, 0.1)])
 
 
@@ -86,6 +94,7 @@ async def client():
     app.state.pool = pool
     app.state.engine = FakeEngine()
     app.state.cache = cache
+    app.state.llm_slots = asyncio.Semaphore(2)   # cap simultaneous engine calls
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -224,3 +233,13 @@ async def test_stats_report_cache_effectiveness(client, needs_redis):
     s = (await client.get("/stats")).json()
     assert s["total"] == 3 and s["done"] == 3 and s["failed"] == 0
     assert s["cache_hits"] == 1 and s["cache_hit_rate"] == 0.333
+
+
+async def test_llm_concurrency_is_capped(client):
+    """A burst of different messages queues behind the cap instead of hammering the provider."""
+    app.state.engine.delay = 0.2
+    responses = await asyncio.gather(*[client.post("/tickets", json={"text": f"unique message {i}"}) for i in range(6)])
+    tickets = [await wait_done(client, r.json()["id"]) for r in responses]
+    assert all(t["status"] == "done" for t in tickets)
+    assert app.state.engine.calls == 6
+    assert app.state.engine.max_active <= 2
