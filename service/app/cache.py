@@ -5,6 +5,7 @@ errors and behaves as a miss, so the API keeps working (just slower) if Redis is
 """
 import json
 import logging
+import time
 import uuid
 from typing import Optional, Tuple
 
@@ -30,8 +31,9 @@ _ERRORS = (redis.RedisError, OSError)
 
 
 class Cache:
-    def __init__(self, url: str, ttl: int = 3600, lock_ttl: int = 60):
-        self._r = redis.from_url(url, socket_connect_timeout=0.5, socket_timeout=1.0)
+    def __init__(self, url: str, ttl: int = 3600, lock_ttl: int = 60,
+                 connect_timeout: float = 0.5, timeout: float = 1.0):
+        self._r = redis.from_url(url, socket_connect_timeout=connect_timeout, socket_timeout=timeout)
         self._ttl = ttl
         self._lock_ttl = lock_ttl
 
@@ -73,6 +75,20 @@ class Cache:
             await self._r.eval(_RELEASE_LOCK, 1, LOCK_KEY.format(text_hash), token)
         except _ERRORS as exc:
             log.warning("cache unlock failed: %s", exc)
+
+    async def allow(self, client_id: str, limit: int, window: int = 60) -> bool:
+        """Fixed-window rate limit: True if this client is still under `limit` requests in the
+        current window. Fails open if Redis is down (same policy as the cache)."""
+        key = f"resolvr:v1:rl:{client_id}:{int(time.time() // window)}"
+        try:
+            pipe = self._r.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, window)
+            count, _ = await pipe.execute()
+            return count <= limit
+        except _ERRORS as exc:
+            log.warning("rate limit check failed, allowing request: %s", exc)
+            return True
 
     async def ping(self) -> bool:
         try:

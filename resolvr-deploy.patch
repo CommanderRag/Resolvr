@@ -1,0 +1,213 @@
+diff --git a/service/DEPLOY.md b/service/DEPLOY.md
+new file mode 100644
+index 0000000..fa2ed6c
+--- /dev/null
++++ b/service/DEPLOY.md
+@@ -0,0 +1,70 @@
++# Deploying Resolvr (no credit card)
++
++API on a Hugging Face Docker Space, Postgres on Neon, Redis on Upstash.
++Free-tier limits change, so check each provider's current terms.
++
++## 1. Postgres (Neon)
++
++1. Create a project and copy the connection string. It ends in `?sslmode=require`.
++2. Apply the schema once (the app only applies small upgrades at startup, not the full schema):
++
++   ```bash
++   psql "<neon-connection-string>" -f service/db/schema.sql
++   ```
++
++## 2. Redis (Upstash)
++
++Create a database and copy the TLS URL: `rediss://default:<password>@<host>:6379`.
++
++## 3. Space
++
++1. huggingface.co → New Space → SDK **Docker** → blank template.
++2. In the Space's *Settings → Variables and secrets*, add:
++
++   | Name | Type | Value |
++   |---|---|---|
++   | `GROQ_API_KEY` | secret | your key |
++   | `DATABASE_URL` | secret | Neon string |
++   | `REDIS_URL` | secret | Upstash `rediss://` URL |
++   | `RATE_LIMIT_PER_MIN` | variable | `30` |
++   | `REDIS_CONNECT_TIMEOUT` | variable | `3` |
++   | `REDIS_TIMEOUT` | variable | `3` |
++   | `HF_HOME` | variable | `/tmp/hf` |
++
++   The default 0.5 s Redis connect timeout is too tight for a remote TLS Redis and would make
++   every request a cache miss. `HF_HOME` avoids permission errors if the container is not root.
++
++3. Push the code. The Space needs a README with front matter, so use a throwaway branch and
++   leave your GitHub README untouched:
++
++   ```bash
++   git remote add space https://huggingface.co/spaces/<user>/resolvr
++   git checkout -b hf
++   printf -- '---\ntitle: Resolvr\nsdk: docker\napp_port: 8000\n---\n' | cat - README.md > R.md && mv R.md README.md
++   git commit -am "Space front matter"
++   git push space hf:main --force
++   git checkout main
++   ```
++
++   (Use a Hugging Face access token with write access as the password.)
++
++4. The first build is slow (torch + model download). Watch the Space's *Logs* tab.
++
++## 4. Check it
++
++```bash
++URL=https://<user>-resolvr.hf.space
++curl $URL/healthz                       # {"status":"ok","redis":"up"}
++curl -X POST $URL/tickets -H 'content-type: application/json' -d '{"text":"where is my order?"}'
++curl $URL/tickets/<id>
++curl $URL/stats                         # cache hit rate after repeating a message
++```
++
++## Known caveats
++
++- Free Spaces sleep when idle, so the first request after a pause is slow.
++- Rate limiting identifies callers by the last `X-Forwarded-For` entry, which is correct behind a
++  single trusted proxy. Check the Space logs for the IPs it sees.
++- Run the load test against your local compose stack, not the public URL: the public one has
++  rate limiting and remote Redis/Postgres, so the numbers aren't comparable.
++- Unfinished tickets are lost if the container restarts, because processing is still in-process.
+diff --git a/service/app/cache.py b/service/app/cache.py
+index 2095fc8..a95085c 100644
+--- a/service/app/cache.py
++++ b/service/app/cache.py
+@@ -5,6 +5,7 @@ errors and behaves as a miss, so the API keeps working (just slower) if Redis is
+ """
+ import json
+ import logging
++import time
+ import uuid
+ from typing import Optional, Tuple
+ 
+@@ -30,8 +31,9 @@ _ERRORS = (redis.RedisError, OSError)
+ 
+ 
+ class Cache:
+-    def __init__(self, url: str, ttl: int = 3600, lock_ttl: int = 60):
+-        self._r = redis.from_url(url, socket_connect_timeout=0.5, socket_timeout=1.0)
++    def __init__(self, url: str, ttl: int = 3600, lock_ttl: int = 60,
++                 connect_timeout: float = 0.5, timeout: float = 1.0):
++        self._r = redis.from_url(url, socket_connect_timeout=connect_timeout, socket_timeout=timeout)
+         self._ttl = ttl
+         self._lock_ttl = lock_ttl
+ 
+@@ -74,6 +76,20 @@ class Cache:
+         except _ERRORS as exc:
+             log.warning("cache unlock failed: %s", exc)
+ 
++    async def allow(self, client_id: str, limit: int, window: int = 60) -> bool:
++        """Fixed-window rate limit: True if this client is still under `limit` requests in the
++        current window. Fails open if Redis is down (same policy as the cache)."""
++        key = f"resolvr:v1:rl:{client_id}:{int(time.time() // window)}"
++        try:
++            pipe = self._r.pipeline()
++            pipe.incr(key)
++            pipe.expire(key, window)
++            count, _ = await pipe.execute()
++            return count <= limit
++        except _ERRORS as exc:
++            log.warning("rate limit check failed, allowing request: %s", exc)
++            return True
++
+     async def ping(self) -> bool:
+         try:
+             return bool(await self._r.ping())
+diff --git a/service/app/config.py b/service/app/config.py
+index 2630a66..d6bec83 100644
+--- a/service/app/config.py
++++ b/service/app/config.py
+@@ -2,6 +2,11 @@ import os
+ 
+ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://resolvr:resolvr@localhost:5432/resolvr")
+ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
++# Per-client-IP limit on POST /tickets (requests/minute, Redis-backed). 0 disables it.
++RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "0"))
++# Remote Redis (e.g. Upstash over TLS) needs more headroom than localhost.
++REDIS_CONNECT_TIMEOUT = float(os.environ.get("REDIS_CONNECT_TIMEOUT", "0.5"))
++REDIS_TIMEOUT = float(os.environ.get("REDIS_TIMEOUT", "1.0"))
+ CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))
+ # LLM provider limits: cap simultaneous calls, and let the SDK retry 429/5xx with backoff (it honours Retry-After).
+ MAX_CONCURRENT_LLM = int(os.environ.get("MAX_CONCURRENT_LLM", "4"))
+diff --git a/service/app/main.py b/service/app/main.py
+index 6ce482d..9c2a825 100644
+--- a/service/app/main.py
++++ b/service/app/main.py
+@@ -21,7 +21,8 @@ async def lifespan(app: FastAPI):
+     app.state.pool = await db.create_pool(config.DATABASE_URL)
+     await db.apply_upgrades(app.state.pool)
+     if getattr(app.state, "cache", None) is None:  # tests inject their own
+-        app.state.cache = Cache(config.REDIS_URL, config.CACHE_TTL_SECONDS)
++        app.state.cache = Cache(config.REDIS_URL, config.CACHE_TTL_SECONDS,
++                                     connect_timeout=config.REDIS_CONNECT_TIMEOUT, timeout=config.REDIS_TIMEOUT)
+     if getattr(app.state, "llm_slots", None) is None:
+         app.state.llm_slots = asyncio.Semaphore(config.MAX_CONCURRENT_LLM)
+     if getattr(app.state, "engine", None) is None:
+@@ -55,8 +56,21 @@ async def process_ticket(app: FastAPI, ticket_id: uuid.UUID) -> None:
+         await db.fail_ticket(pool, ticket_id, f"{type(exc).__name__}: {exc}"[:500])
+ 
+ 
++def client_id(request: Request) -> str:
++    """Identify the caller for rate limiting. Behind a proxy the *last* X-Forwarded-For entry is
++    the one the proxy itself appended (earlier entries are client-supplied and spoofable)."""
++    fwd = request.headers.get("x-forwarded-for")
++    if fwd:
++        return fwd.split(",")[-1].strip()
++    return request.client.host if request.client else "unknown"
++
++
+ @app.post("/tickets", status_code=202)
+ async def create_ticket(body: TicketIn, request: Request, tasks: BackgroundTasks):
++    if config.RATE_LIMIT_PER_MIN > 0 and not await request.app.state.cache.allow(
++            client_id(request), config.RATE_LIMIT_PER_MIN):
++        raise HTTPException(status_code=429, detail="rate limit exceeded",
++                            headers={"Retry-After": "60"})
+     text = body.text.strip()
+     if not text:
+         raise HTTPException(status_code=422, detail="text must not be blank")
+diff --git a/service/tests/test_api.py b/service/tests/test_api.py
+index be87260..9873450 100644
+--- a/service/tests/test_api.py
++++ b/service/tests/test_api.py
+@@ -22,7 +22,7 @@ import httpx
+ import pytest
+ import pytest_asyncio
+ 
+-from app import db
++from app import config, db
+ from app.cache import Cache
+ from app.engine import Result
+ from app.main import app
+@@ -243,3 +243,26 @@ async def test_llm_concurrency_is_capped(client):
+     assert all(t["status"] == "done" for t in tickets)
+     assert app.state.engine.calls == 6
+     assert app.state.engine.max_active <= 2
++
++
++# ---------- rate limiting --------------------------------------------------
++async def test_rate_limit_returns_429_after_limit(client, needs_redis, monkeypatch):
++    monkeypatch.setattr(config, "RATE_LIMIT_PER_MIN", 3)
++    headers = {"x-forwarded-for": f"198.51.100.{uuid.uuid4().int % 250}-{uuid.uuid4().hex}"}
++    codes = [(await client.post("/tickets", json={"text": f"hi {i}"}, headers=headers)).status_code
++             for i in range(5)]
++    assert codes == [202, 202, 202, 429, 429]
++    other = {"x-forwarded-for": f"other-{uuid.uuid4().hex}"}   # a different client is unaffected
++    assert (await client.post("/tickets", json={"text": "hello"}, headers=other)).status_code == 202
++
++
++async def test_rate_limit_fails_open_when_redis_down(client, monkeypatch):
++    monkeypatch.setattr(config, "RATE_LIMIT_PER_MIN", 1)
++    old = app.state.cache
++    app.state.cache = Cache("redis://127.0.0.1:1/0", ttl=60)   # nothing listens here
++    try:
++        for i in range(3):
++            assert (await client.post("/tickets", json={"text": f"hi {i}"})).status_code == 202
++    finally:
++        await app.state.cache.close()
++        app.state.cache = old

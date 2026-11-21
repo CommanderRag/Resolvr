@@ -22,7 +22,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from app import db
+from app import config, db
 from app.cache import Cache
 from app.engine import Result
 from app.main import app
@@ -243,3 +243,26 @@ async def test_llm_concurrency_is_capped(client):
     assert all(t["status"] == "done" for t in tickets)
     assert app.state.engine.calls == 6
     assert app.state.engine.max_active <= 2
+
+
+# ---------- rate limiting --------------------------------------------------
+async def test_rate_limit_returns_429_after_limit(client, needs_redis, monkeypatch):
+    monkeypatch.setattr(config, "RATE_LIMIT_PER_MIN", 3)
+    headers = {"x-forwarded-for": f"198.51.100.{uuid.uuid4().int % 250}-{uuid.uuid4().hex}"}
+    codes = [(await client.post("/tickets", json={"text": f"hi {i}"}, headers=headers)).status_code
+             for i in range(5)]
+    assert codes == [202, 202, 202, 429, 429]
+    other = {"x-forwarded-for": f"other-{uuid.uuid4().hex}"}   # a different client is unaffected
+    assert (await client.post("/tickets", json={"text": "hello"}, headers=other)).status_code == 202
+
+
+async def test_rate_limit_fails_open_when_redis_down(client, monkeypatch):
+    monkeypatch.setattr(config, "RATE_LIMIT_PER_MIN", 1)
+    old = app.state.cache
+    app.state.cache = Cache("redis://127.0.0.1:1/0", ttl=60)   # nothing listens here
+    try:
+        for i in range(3):
+            assert (await client.post("/tickets", json={"text": f"hi {i}"})).status_code == 202
+    finally:
+        await app.state.cache.close()
+        app.state.cache = old

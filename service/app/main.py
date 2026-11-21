@@ -21,7 +21,8 @@ async def lifespan(app: FastAPI):
     app.state.pool = await db.create_pool(config.DATABASE_URL)
     await db.apply_upgrades(app.state.pool)
     if getattr(app.state, "cache", None) is None:  # tests inject their own
-        app.state.cache = Cache(config.REDIS_URL, config.CACHE_TTL_SECONDS)
+        app.state.cache = Cache(config.REDIS_URL, config.CACHE_TTL_SECONDS,
+                                     connect_timeout=config.REDIS_CONNECT_TIMEOUT, timeout=config.REDIS_TIMEOUT)
     if getattr(app.state, "llm_slots", None) is None:
         app.state.llm_slots = asyncio.Semaphore(config.MAX_CONCURRENT_LLM)
     if getattr(app.state, "engine", None) is None:
@@ -55,8 +56,21 @@ async def process_ticket(app: FastAPI, ticket_id: uuid.UUID) -> None:
         await db.fail_ticket(pool, ticket_id, f"{type(exc).__name__}: {exc}"[:500])
 
 
+def client_id(request: Request) -> str:
+    """Identify the caller for rate limiting. Behind a proxy the *last* X-Forwarded-For entry is
+    the one the proxy itself appended (earlier entries are client-supplied and spoofable)."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
 @app.post("/tickets", status_code=202)
 async def create_ticket(body: TicketIn, request: Request, tasks: BackgroundTasks):
+    if config.RATE_LIMIT_PER_MIN > 0 and not await request.app.state.cache.allow(
+            client_id(request), config.RATE_LIMIT_PER_MIN):
+        raise HTTPException(status_code=429, detail="rate limit exceeded",
+                            headers={"Retry-After": "60"})
     text = body.text.strip()
     if not text:
         raise HTTPException(status_code=422, detail="text must not be blank")
