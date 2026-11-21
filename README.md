@@ -1,3 +1,4 @@
+![CI](https://github.com/CommanderRag/Resolvr/actions/workflows/ci.yml/badge.svg)
 # Resolvr
 
 An AI customer-support service. Send it a customer message; it classifies the intent, retrieves how
